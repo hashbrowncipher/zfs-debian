@@ -25,14 +25,13 @@ Index: zfs-linux-0.6.5.3/config/zfs-meta.m4
  
  		ZFS_META_NAME=_ZFS_AC_META_GETVAL([(Name|Project|Package)]);
  		if test -n "$ZFS_META_NAME"; then
-@@ -66,8 +68,30 @@
+@@ -66,8 +68,29 @@
  			AC_SUBST([ZFS_META_VERSION])
  		fi
  
 +		if test -n "${_dpkg_parsechangelog}"; then
 +			_dpkg_version=$(echo "${_dpkg_parsechangelog}" \
-+				| $AWK '$[]1 == "Version:" { print $[]2; }' \
-+				| cut -d- -f1)
++				| $AWK '$[]1 == "Version:" { print $[]2; }')
 +			if test "${_dpkg_version}" != "$ZFS_META_VERSION"; then
 +				AC_MSG_ERROR([
 +	*** Version $ZFS_META_VERSION in the META file is different than
