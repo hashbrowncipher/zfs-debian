@@ -17,6 +17,9 @@ Build-Depends: autotools-dev,
                libtool,
                lsb-release,
                po-debconf,
+               python-cffi,
+               python-setuptools,
+               python-sphinx,
                python3,
                uuid-dev,
                zlib1g-dev
@@ -86,6 +89,53 @@ Description: OpenZFS pool library for Linux
  checksums.
  .
  This zpool library provides support for managing zpools.
+
+Package: python-pyzfs
+Section: contrib/python
+Architecture: linux-any
+Depends: ${misc:Depends},
+         ${python:Depends},
+         python-cffi,
+         zfsutils-linux (>= ${binary:Version})
+Description: A wrapper for libzfs_core C library
+ libzfs_core is intended to be a stable interface for programmatic
+ administration of ZFS. This wrapper provides one-to-one wrappers for
+ libzfs_core API functions, but the signatures and types are more natural to
+ Python.
+ .
+ nvlists are wrapped as dictionaries or lists depending on their usage.
+ Some parameters have default values depending on typical use for
+ increased convenience. Enumerations and bit flags become strings and lists
+ of strings in Python. Errors are reported as exceptions rather than integer
+ errno-style error codes.  The wrapper takes care to provide one-to-many
+ mapping of the error codes to the exceptions by interpreting a context
+ in which the error code is produced.
+ .
+ This package contains the python version 2 library.
+
+Package: pyzfs-doc
+Section: contrib/doc
+Architecture: all
+Depends:
+ ${sphinxdoc:Depends},
+ ${misc:Depends}
+Recommends:
+ python-pyzfs
+Description: A wrapper for libzfs_core C library
+ libzfs_core is intended to be a stable interface for programmatic
+ administration of ZFS. This wrapper provides one-to-one wrappers for
+ libzfs_core API functions, but the signatures and types are more natural to
+ Python.
+ .
+ nvlists are wrapped as dictionaries or lists depending on their usage.
+ Some parameters have default values depending on typical use for
+ increased convenience. Enumerations and bit flags become strings and lists
+ of strings in Python. Errors are reported as exceptions rather than integer
+ errno-style error codes.  The wrapper takes care to provide one-to-many
+ mapping of the error codes to the exceptions by interpreting a context
+ in which the error code is produced.
+ .
+ This package contains the documentation.
 
 Package: zfs-dkms
 Architecture: all
@@ -177,6 +227,7 @@ Depends: acl,
          mdadm,
          parted,
          python,
+         python-pyzfs,
          sudo,
          sysstat,
          zfs-modules | zfs-dkms,
