@@ -25,6 +25,7 @@
  * Copyright (c) 2014, 2015 by Delphix. All rights reserved.
  * Copyright 2016 Igor Kozhukhov <ikozhukhov@gmail.com>
  * Copyright 2017 RackTop Systems.
+ * Copyright (c) 2018 Datto Inc.
  */
 
 /*
@@ -78,6 +79,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
+#include <sys/dsl_crypt.h>
 
 #include <libzfs.h>
 
@@ -133,6 +135,10 @@ is_shared(libzfs_handle_t *hdl, const char *mountpoint, zfs_share_proto_t proto)
 	char *ptr;
 
 	if (hdl->libzfs_sharetab == NULL)
+		return (SHARED_NOT_SHARED);
+
+	/* Reopen ZFS_SHARETAB to prevent reading stale data from open file */
+	if (freopen(ZFS_SHARETAB, "r", hdl->libzfs_sharetab) == NULL)
 		return (SHARED_NOT_SHARED);
 
 	(void) fseek(hdl->libzfs_sharetab, 0, SEEK_SET);
@@ -466,6 +472,7 @@ zfs_mount(zfs_handle_t *zhp, const char *options, int flags)
 	char mntopts[MNT_LINE_MAX];
 	char overlay[ZFS_MAXPROPLEN];
 	libzfs_handle_t *hdl = zhp->zfs_hdl;
+	uint64_t keystatus;
 	int remount = 0, rc;
 
 	if (options == NULL) {
@@ -500,6 +507,39 @@ zfs_mount(zfs_handle_t *zhp, const char *options, int flags)
 		return (zfs_error_fmt(hdl, EZFS_MOUNTFAILED,
 		    dgettext(TEXT_DOMAIN, "cannot mount '%s'"),
 		    mountpoint));
+	}
+
+	/*
+	 * If the filesystem is encrypted the key must be loaded  in order to
+	 * mount. If the key isn't loaded, the MS_CRYPT flag decides whether
+	 * or not we attempt to load the keys. Note: we must call
+	 * zfs_refresh_properties() here since some callers of this function
+	 * (most notably zpool_enable_datasets()) may implicitly load our key
+	 * by loading the parent's key first.
+	 */
+	if (zfs_prop_get_int(zhp, ZFS_PROP_ENCRYPTION) != ZIO_CRYPT_OFF) {
+		zfs_refresh_properties(zhp);
+		keystatus = zfs_prop_get_int(zhp, ZFS_PROP_KEYSTATUS);
+
+		/*
+		 * If the key is unavailable and MS_CRYPT is set give the
+		 * user a chance to enter the key. Otherwise just fail
+		 * immediately.
+		 */
+		if (keystatus == ZFS_KEYSTATUS_UNAVAILABLE) {
+			if (flags & MS_CRYPT) {
+				rc = zfs_crypto_load_key(zhp, B_FALSE, NULL);
+				if (rc)
+					return (rc);
+			} else {
+				zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+				    "encryption key not loaded"));
+				return (zfs_error_fmt(hdl, EZFS_MOUNTFAILED,
+				    dgettext(TEXT_DOMAIN, "cannot mount '%s'"),
+				    mountpoint));
+			}
+		}
+
 	}
 
 	/*
@@ -660,7 +700,8 @@ zfs_unmountall(zfs_handle_t *zhp, int flags)
 	prop_changelist_t *clp;
 	int ret;
 
-	clp = changelist_gather(zhp, ZFS_PROP_MOUNTPOINT, 0, flags);
+	clp = changelist_gather(zhp, ZFS_PROP_MOUNTPOINT,
+	    CL_GATHER_ITER_MOUNTED, 0);
 	if (clp == NULL)
 		return (-1);
 
@@ -1137,6 +1178,12 @@ mount_cb(zfs_handle_t *zhp, void *data)
 		return (0);
 	}
 
+	if (zfs_prop_get_int(zhp, ZFS_PROP_KEYSTATUS) ==
+	    ZFS_KEYSTATUS_UNAVAILABLE) {
+		zfs_close(zhp);
+		return (0);
+	}
+
 	/*
 	 * If this filesystem is inconsistent and has a receive resume
 	 * token, we can not mount it.
@@ -1226,6 +1273,14 @@ zpool_enable_datasets(zpool_handle_t *zhp, const char *mntopts, int flags)
 
 	ret = 0;
 	for (i = 0; i < cb.cb_used; i++) {
+		/*
+		 * don't attempt to mount encrypted datasets with
+		 * unloaded keys
+		 */
+		if (zfs_prop_get_int(cb.cb_handles[i], ZFS_PROP_KEYSTATUS) ==
+		    ZFS_KEYSTATUS_UNAVAILABLE)
+			continue;
+
 		if (zfs_mount(cb.cb_handles[i], mntopts, flags) != 0)
 			ret = -1;
 		else

@@ -34,6 +34,8 @@
 %endif
 
 %bcond_with    debug
+%bcond_with    debuginfo
+%bcond_with    asan
 %bcond_with    systemd
 
 # Python permits the !/usr/bin/python shebang for scripts that are cross
@@ -44,7 +46,7 @@
 #
 # Details: https://github.com/zfsonlinux/zfs/issues/7360
 #
-%global __brp_mangle_shebangs_exclude_from arc_summary.py|arcstat.py|dbufstat.py|test-runner.py
+%global __brp_mangle_shebangs_exclude_from arc_summary.py|arcstat.py|dbufstat.py|test-runner.py|zts-report.py
 
 # Generic enable switch for systemd
 %if %{with systemd}
@@ -78,13 +80,13 @@ License:        @ZFS_META_LICENSE@
 URL:            http://zfsonlinux.org/
 Source0:        %{name}-%{version}.tar.gz
 BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
-Requires:       spl = %{version}
 Requires:       libzpool2 = %{version}
 Requires:       libnvpair1 = %{version}
 Requires:       libuutil1 = %{version}
 Requires:       libzfs2 = %{version}
 Requires:       %{name}-kmod = %{version}
 Provides:       %{name}-kmod-common = %{version}
+Obsoletes:      spl
 
 # zfs-fuse provides the same commands and man pages that ZoL does. Renaming
 # those on either side would conflict with all available documentation.
@@ -96,8 +98,13 @@ BuildRequires:  libuuid-devel
 BuildRequires:  libblkid-devel
 BuildRequires:  libudev-devel
 BuildRequires:  libattr-devel
+BuildRequires:  openssl-devel
 %if 0%{?fedora} >= 28
 BuildRequires:  libtirpc-devel
+%endif
+Requires:       openssl
+%if 0%{?_systemd}
+BuildRequires: systemd
 %endif
 %endif
 
@@ -195,7 +202,6 @@ Requires:       fio
 Requires:       acl
 Requires:       sudo
 Requires:       sysstat
-Requires:       rng-tools
 Requires:       libaio
 %if 0%{?rhel}%{?fedora}%{?suse_version}
 BuildRequires:  libaio-devel
@@ -218,6 +224,26 @@ Requires:       grep
 This package contains a dracut module used to construct an initramfs
 image which is ZFS aware.
 
+%if 0%{?_pyzfs}
+%package -n pyzfs
+Summary:        Python wrapper for libzfs_core
+Group:          Development/Languages/Python
+License:        Apache-2.0
+BuildArch:      noarch
+Requires:       libzfs2 = %{version}
+Requires:       libnvpair1 = %{version}
+Requires:       libffi
+Requires:       python >= 2.7
+Requires:       python-cffi
+%if 0%{?rhel}%{?fedora}%{?suse_version}
+BuildRequires:  python-devel
+BuildRequires:  libffi-devel
+%endif
+
+%description -n pyzfs
+This package provides a python wrapper for the libzfs_core C library.
+%endif
+
 %if 0%{?_initramfs}
 %package initramfs
 Summary:        Initramfs module
@@ -237,6 +263,19 @@ image which is ZFS aware.
 %else
     %define debug --disable-debug
 %endif
+
+%if %{with debuginfo}
+    %define debuginfo --enable-debuginfo
+%else
+    %define debuginfo --disable-debuginfo
+%endif
+
+%if %{with asan}
+    %define asan --enable-asan
+%else
+    %define asan --disable-asan
+%endif
+
 %if 0%{?_systemd}
     %define systemd --enable-systemd --with-systemdunitdir=%{_unitdir} --with-systemdpresetdir=%{_presetdir} --disable-sysvinit
     %define systemd_svcs zfs-import-cache.service zfs-import-scan.service zfs-mount.service zfs-share.service zfs-zed.service zfs.target zfs-import.target
@@ -254,6 +293,8 @@ image which is ZFS aware.
     --with-dracutdir=%{_dracutdir} \
     --disable-static \
     %{debug} \
+    %{debuginfo} \
+    %{asan} \
     %{systemd}
 make %{?_smp_mflags}
 
@@ -281,6 +322,15 @@ if [ -x /sbin/chkconfig ]; then
 fi
 %endif
 exit 0
+
+# On RHEL/CentOS 7 the static nodes aren't refreshed by default after
+# installing a package.  This is the default behavior for Fedora.
+%posttrans
+%if 0%{?rhel} == 7 || 0%{?centos} == 7
+systemctl restart kmod-static-nodes
+systemctl restart systemd-tmpfiles-setup-dev
+udevadm trigger
+%endif
 
 %preun
 %if 0%{?_systemd}
@@ -326,6 +376,7 @@ systemctl --system daemon-reload >/dev/null || true
 /usr/lib/modules-load.d/*
 %{_unitdir}/*
 %{_presetdir}/*
+%{_generatordir}/*
 %else
 %config(noreplace) %{_sysconfdir}/init.d/*
 %config(noreplace) %{_initconfdir}/zfs
@@ -350,8 +401,7 @@ systemctl --system daemon-reload >/dev/null || true
 %{_datadir}/pkgconfig/libzfs_core.pc
 %{_libdir}/*.so
 %{_includedir}/*
-%doc AUTHORS COPYRIGHT DISCLAIMER
-%doc OPENSOLARIS.LICENSE README.markdown
+%doc AUTHORS COPYRIGHT LICENSE NOTICE README.md
 
 %files test
 %{_datadir}/%{name}
@@ -359,6 +409,15 @@ systemctl --system daemon-reload >/dev/null || true
 %files dracut
 %doc contrib/dracut/README.dracut.markdown
 %{_dracutdir}/modules.d/*
+
+%if 0%{?_pyzfs}
+%files -n pyzfs
+%doc contrib/pyzfs/README
+%doc contrib/pyzfs/LICENSE
+%defattr(-,root,root,-)
+%{python_sitelib}/libzfs_core/*
+%{python_sitelib}/pyzfs*
+%endif
 
 %if 0%{?_initramfs}
 %files initramfs
@@ -369,41 +428,3 @@ systemctl --system daemon-reload >/dev/null || true
 # ignore those files.
 %exclude /usr/share/initramfs-tools
 %endif
-
-%changelog
-* Thu Sep 13 2018 Tony Hutter <hutter2@llnl.gov> - 0.7.11-1
-- Released 0.7.11-1, detailed release notes are available at:
-- https://github.com/zfsonlinux/zfs/releases/tag/zfs-0.7.11
-* Wed Sep 05 2018 Tony Hutter <hutter2@llnl.gov> - 0.7.10-1
-- Released 0.7.10-1, detailed release notes are available at:
-- https://github.com/zfsonlinux/zfs/releases/tag/zfs-0.7.10
-* Tue May 08 2018 Tony Hutter <hutter2@llnl.gov> - 0.7.9-1
-- Released 0.7.9-1, detailed release notes are available at:
-- https://github.com/zfsonlinux/zfs/releases/tag/zfs-0.7.9
-* Mon Apr 09 2018 Tony Hutter <hutter2@llnl.gov> - 0.7.8-1
-- Released 0.7.8-1, detailed release notes are available at:
-- https://github.com/zfsonlinux/zfs/releases/tag/zfs-0.7.8
-* Wed Mar 14 2018 Tony Hutter <hutter2@llnl.gov> - 0.7.7-1
-- Released 0.7.7-1, detailed release notes are available at:
-- https://github.com/zfsonlinux/zfs/releases/tag/zfs-0.7.7
-* Thu Feb 01 2018 Tony Hutter <hutter2@llnl.gov> - 0.7.6-1
-- Released 0.7.6-1, detailed release notes are available at:
-- https://github.com/zfsonlinux/zfs/releases/tag/zfs-0.7.6
-* Mon Dec 18 2017 Tony Hutter <hutter2@llnl.gov> - 0.7.5-1
-- Released 0.7.5-1, detailed release notes are available at:
-- https://github.com/zfsonlinux/zfs/releases/tag/zfs-0.7.5
-* Thu Dec 07 2017 Tony Hutter <hutter2@llnl.gov> - 0.7.4-1
-- Released 0.7.4-1, detailed release notes are available at:
-- https://github.com/zfsonlinux/zfs/releases/tag/zfs-0.7.4
-* Wed Oct 18 2017 Tony Hutter <hutter2@llnl.gov> - 0.7.3-1
-- Released 0.7.3-1, detailed release notes are available at:
-- https://github.com/zfsonlinux/zfs/releases/tag/zfs-0.7.3
-* Fri Sep 22 2017 Tony Hutter <hutter2@llnl.gov> - 0.7.2-1
-- Released 0.7.2-1, detailed release notes are available at:
-- https://github.com/zfsonlinux/zfs/releases/tag/zfs-0.7.2
-* Tue Aug 8 2017 Tony Hutter <hutter2@llnl.gov> - 0.7.1-1
-- Released 0.7.1-1, detailed release notes are available at:
-- https://github.com/zfsonlinux/zfs/releases/tag/zfs-0.7.1
-* Wed Jul 26 2017 Brian Behlendorf <behlendorf1@llnl.gov> - 0.7.0-1
-- Released 0.7.0-1, detailed release notes are available at:
-- https://github.com/zfsonlinux/zfs/releases/tag/zfs-0.7.0

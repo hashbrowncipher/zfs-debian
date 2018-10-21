@@ -39,36 +39,41 @@
 # STRATEGY:
 #	1. Setup a mirror pool and filled with data.
 #	2. Detach one of devices
-#	3. Verify scrub failed until the resilver completed
+#	3. Create a file for the resilver to work on so it takes some time
+#	4. Export/import the pool to ensure the cache is dropped
+#	5. Verify scrub failed until the resilver completed
 #
 # NOTES:
-#	A 10ms delay is added to 10% of zio's in order to ensure that the
-#	resilver does not complete before the scrub can be issued.  This
-#	can occur when testing with small pools or very fast hardware.
+#	Artificially limit the scrub speed by setting the zfs_scan_vdev_limit
+#	low in order to ensure that the scrub does not complete early.
+#
 
 function cleanup
 {
-	log_must zinject -c all
+	log_must set_tunable64 zfs_scan_vdev_limit $ZFS_SCAN_VDEV_LIMIT_DEFAULT
+	rm -f $mntpnt/extra
 }
 
 verify_runnable "global"
-
-# See issue: https://github.com/zfsonlinux/zfs/issues/5444
-if is_32bit; then
-	log_unsupported "Test case fails on 32-bit systems"
-fi
 
 log_onexit cleanup
 
 log_assert "Resilver prevent scrub from starting until the resilver completes"
 
-log_must zpool detach $TESTPOOL $DISK2
-log_must zinject -d $DISK1 -D10:1 $TESTPOOL
-log_must zpool attach $TESTPOOL $DISK1 $DISK2
+mntpnt=$(get_prop mountpoint $TESTPOOL/$TESTFS)
+log_must set_tunable64 zfs_scan_vdev_limit $ZFS_SCAN_VDEV_LIMIT_SLOW
+
+while ! is_pool_resilvering $TESTPOOL; do
+	log_must zpool detach $TESTPOOL $DISK2
+	log_must file_write -b 1048576 -c 128 -o create -d 0 -f $mntpnt/extra
+	log_must zpool export $TESTPOOL
+	log_must zpool import $TESTPOOL
+	log_must zpool attach $TESTPOOL $DISK1 $DISK2
+done
+
 log_must is_pool_resilvering $TESTPOOL
 log_mustnot zpool scrub $TESTPOOL
 
-# Allow the resilver to finish, or it will interfere with the next test.
 while ! is_pool_resilvered $TESTPOOL; do
 	sleep 1
 done

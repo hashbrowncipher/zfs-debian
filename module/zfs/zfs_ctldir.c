@@ -71,11 +71,9 @@
 #include <sys/types.h>
 #include <sys/param.h>
 #include <sys/time.h>
-#include <sys/systm.h>
 #include <sys/sysmacros.h>
 #include <sys/pathname.h>
 #include <sys/vfs.h>
-#include <sys/vfs_opreg.h>
 #include <sys/zfs_ctldir.h>
 #include <sys/zfs_ioctl.h>
 #include <sys/zfs_vfsops.h>
@@ -85,7 +83,6 @@
 #include <sys/dmu_objset.h>
 #include <sys/dsl_destroy.h>
 #include <sys/dsl_deleg.h>
-#include <sys/mount.h>
 #include <sys/zpl.h>
 #include "zfs_namecheck.h"
 
@@ -120,7 +117,7 @@ typedef struct {
 	taskqid_t	se_taskqid;	/* scheduled unmount taskqid */
 	avl_node_t	se_node_name;	/* zfs_snapshots_by_name link */
 	avl_node_t	se_node_objsetid; /* zfs_snapshots_by_objsetid link */
-	refcount_t	se_refcount;	/* reference count */
+	zfs_refcount_t	se_refcount;	/* reference count */
 } zfs_snapentry_t;
 
 static void zfsctl_snapshot_unmount_delay_impl(zfs_snapentry_t *se, int delay);
@@ -144,7 +141,7 @@ zfsctl_snapshot_alloc(char *full_name, char *full_path, spa_t *spa,
 	se->se_root_dentry = root_dentry;
 	se->se_taskqid = TASKQID_INVALID;
 
-	refcount_create(&se->se_refcount);
+	zfs_refcount_create(&se->se_refcount);
 
 	return (se);
 }
@@ -156,7 +153,7 @@ zfsctl_snapshot_alloc(char *full_name, char *full_path, spa_t *spa,
 static void
 zfsctl_snapshot_free(zfs_snapentry_t *se)
 {
-	refcount_destroy(&se->se_refcount);
+	zfs_refcount_destroy(&se->se_refcount);
 	strfree(se->se_name);
 	strfree(se->se_path);
 
@@ -169,7 +166,7 @@ zfsctl_snapshot_free(zfs_snapentry_t *se)
 static void
 zfsctl_snapshot_hold(zfs_snapentry_t *se)
 {
-	refcount_add(&se->se_refcount, NULL);
+	zfs_refcount_add(&se->se_refcount, NULL);
 }
 
 /*
@@ -179,7 +176,7 @@ zfsctl_snapshot_hold(zfs_snapentry_t *se)
 static void
 zfsctl_snapshot_rele(zfs_snapentry_t *se)
 {
-	if (refcount_remove(&se->se_refcount, NULL) == 0)
+	if (zfs_refcount_remove(&se->se_refcount, NULL) == 0)
 		zfsctl_snapshot_free(se);
 }
 
@@ -192,7 +189,7 @@ static void
 zfsctl_snapshot_add(zfs_snapentry_t *se)
 {
 	ASSERT(RW_WRITE_HELD(&zfs_snapshot_lock));
-	refcount_add(&se->se_refcount, NULL);
+	zfs_refcount_add(&se->se_refcount, NULL);
 	avl_add(&zfs_snapshots_by_name, se);
 	avl_add(&zfs_snapshots_by_objsetid, se);
 }
@@ -269,7 +266,7 @@ zfsctl_snapshot_find_by_name(char *snapname)
 	search.se_name = snapname;
 	se = avl_find(&zfs_snapshots_by_name, &search, NULL);
 	if (se)
-		refcount_add(&se->se_refcount, NULL);
+		zfs_refcount_add(&se->se_refcount, NULL);
 
 	return (se);
 }
@@ -290,7 +287,7 @@ zfsctl_snapshot_find_by_objsetid(spa_t *spa, uint64_t objsetid)
 	search.se_objsetid = objsetid;
 	se = avl_find(&zfs_snapshots_by_objsetid, &search, NULL);
 	if (se)
-		refcount_add(&se->se_refcount, NULL);
+		zfs_refcount_add(&se->se_refcount, NULL);
 
 	return (se);
 }
@@ -308,7 +305,7 @@ zfsctl_snapshot_rename(char *old_snapname, char *new_snapname)
 
 	se = zfsctl_snapshot_find_by_name(old_snapname);
 	if (se == NULL)
-		return (ENOENT);
+		return (SET_ERROR(ENOENT));
 
 	zfsctl_snapshot_remove(se);
 	strfree(se->se_name);
@@ -358,8 +355,6 @@ snapentry_expire(void *data)
 static void
 zfsctl_snapshot_unmount_cancel(zfs_snapentry_t *se)
 {
-	ASSERT(RW_LOCK_HELD(&zfs_snapshot_lock));
-
 	if (taskq_cancel_id(system_delay_taskq, se->se_taskqid) == 0) {
 		se->se_taskqid = TASKQID_INVALID;
 		zfsctl_snapshot_rele(se);
@@ -570,13 +565,14 @@ zfsctl_destroy(zfsvfs_t *zfsvfs)
 		uint64_t objsetid = dmu_objset_id(zfsvfs->z_os);
 
 		rw_enter(&zfs_snapshot_lock, RW_WRITER);
-		if ((se = zfsctl_snapshot_find_by_objsetid(spa, objsetid))
-		    != NULL) {
-			zfsctl_snapshot_unmount_cancel(se);
+		se = zfsctl_snapshot_find_by_objsetid(spa, objsetid);
+		if (se != NULL)
 			zfsctl_snapshot_remove(se);
+		rw_exit(&zfs_snapshot_lock);
+		if (se != NULL) {
+			zfsctl_snapshot_unmount_cancel(se);
 			zfsctl_snapshot_rele(se);
 		}
-		rw_exit(&zfs_snapshot_lock);
 	} else if (zfsvfs->z_ctldir) {
 		iput(zfsvfs->z_ctldir);
 		zfsvfs->z_ctldir = NULL;
@@ -751,7 +747,7 @@ zfsctl_snapshot_path_objset(zfsvfs_t *zfsvfs, uint64_t objsetid,
 	int error = 0;
 
 	if (zfsvfs->z_vfs->vfs_mntpoint == NULL)
-		return (ENOENT);
+		return (SET_ERROR(ENOENT));
 
 	cookie = spl_fstrans_mark();
 	snapname = kmem_alloc(ZFS_MAX_DATASET_NAME_LEN, KM_SLEEP);
@@ -856,7 +852,7 @@ zfsctl_snapdir_rename(struct inode *sdip, char *snm,
 	int error;
 
 	if (!zfs_admin_snapshot)
-		return (EACCES);
+		return (SET_ERROR(EACCES));
 
 	ZFS_ENTER(zfsvfs);
 
@@ -933,7 +929,7 @@ zfsctl_snapdir_remove(struct inode *dip, char *name, cred_t *cr, int flags)
 	int error;
 
 	if (!zfs_admin_snapshot)
-		return (EACCES);
+		return (SET_ERROR(EACCES));
 
 	ZFS_ENTER(zfsvfs);
 
@@ -982,7 +978,7 @@ zfsctl_snapdir_mkdir(struct inode *dip, char *dirname, vattr_t *vap,
 	int error;
 
 	if (!zfs_admin_snapshot)
-		return (EACCES);
+		return (SET_ERROR(EACCES));
 
 	dsname = kmem_alloc(ZFS_MAX_DATASET_NAME_LEN, KM_SLEEP);
 
@@ -1029,7 +1025,7 @@ zfsctl_snapshot_unmount(char *snapname, int flags)
 	rw_enter(&zfs_snapshot_lock, RW_READER);
 	if ((se = zfsctl_snapshot_find_by_name(snapname)) == NULL) {
 		rw_exit(&zfs_snapshot_lock);
-		return (ENOENT);
+		return (SET_ERROR(ENOENT));
 	}
 	rw_exit(&zfs_snapshot_lock);
 
@@ -1070,7 +1066,7 @@ zfsctl_snapshot_mount(struct path *path, int flags)
 	struct path spath;
 
 	if (ip == NULL)
-		return (EISDIR);
+		return (SET_ERROR(EISDIR));
 
 	zfsvfs = ITOZSB(ip);
 	ZFS_ENTER(zfsvfs);

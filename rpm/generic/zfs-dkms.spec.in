@@ -21,10 +21,10 @@ BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 BuildArch:      noarch
 
 Requires:       dkms >= 2.2.0.3
-Requires:       spl-dkms = %{version}
 Requires:       gcc, make, perl
 %if 0%{?rhel}%{?fedora}%{?mageia}%{?suse_version}
 Requires:       kernel-devel
+Obsoletes:      spl-dkms
 %endif
 Provides:       %{module}-kmod = %{version}
 AutoReqProv:    no
@@ -79,7 +79,3 @@ if [ "$SPEC_META_ALIAS" = "$DKMS_META_ALIAS" ]; then
     dkms remove -m %{module} -v %{version} --all %{!?not_rpm:--rpm_safe_upgrade}
 fi
 exit 0
-
-%changelog
-* %(date "+%a %b %d %Y") %packager %{version}-%{release}
-- Automatic build by DKMS

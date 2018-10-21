@@ -20,24 +20,20 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012, 2015 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2018 by Delphix. All rights reserved.
  */
 
 /* Portions Copyright 2010 Robert Milkowski */
 
 #include <sys/types.h>
 #include <sys/param.h>
-#include <sys/systm.h>
 #include <sys/sysmacros.h>
 #include <sys/kmem.h>
 #include <sys/pathname.h>
 #include <sys/vnode.h>
 #include <sys/vfs.h>
-#include <sys/vfs_opreg.h>
 #include <sys/mntent.h>
-#include <sys/mount.h>
 #include <sys/cmn_err.h>
-#include "fs/fs_subr.h"
 #include <sys/zfs_znode.h>
 #include <sys/zfs_vnops.h>
 #include <sys/zfs_dir.h>
@@ -51,18 +47,12 @@
 #include <sys/zap.h>
 #include <sys/sa.h>
 #include <sys/sa_impl.h>
-#include <sys/varargs.h>
 #include <sys/policy.h>
 #include <sys/atomic.h>
-#include <sys/mkdev.h>
-#include <sys/modctl.h>
-#include <sys/refstr.h>
 #include <sys/zfs_ioctl.h>
 #include <sys/zfs_ctldir.h>
 #include <sys/zfs_fuid.h>
-#include <sys/bootconf.h>
 #include <sys/sunddi.h>
-#include <sys/dnlc.h>
 #include <sys/dmu_objset.h>
 #include <sys/spa_boot.h>
 #include <sys/zpl.h>
@@ -536,8 +526,14 @@ unregister:
 
 static int
 zfs_space_delta_cb(dmu_object_type_t bonustype, void *data,
-    uint64_t *userp, uint64_t *groupp)
+    uint64_t *userp, uint64_t *groupp, uint64_t *projectp)
 {
+	sa_hdr_phys_t sa;
+	sa_hdr_phys_t *sap = data;
+	uint64_t flags;
+	int hdrsize;
+	boolean_t swap = B_FALSE;
+
 	/*
 	 * Is it a valid type of object to track?
 	 */
@@ -557,42 +553,49 @@ zfs_space_delta_cb(dmu_object_type_t bonustype, void *data,
 		znode_phys_t *znp = data;
 		*userp = znp->zp_uid;
 		*groupp = znp->zp_gid;
+		*projectp = ZFS_DEFAULT_PROJID;
+		return (0);
+	}
+
+	if (sap->sa_magic == 0) {
+		/*
+		 * This should only happen for newly created files
+		 * that haven't had the znode data filled in yet.
+		 */
+		*userp = 0;
+		*groupp = 0;
+		*projectp = ZFS_DEFAULT_PROJID;
+		return (0);
+	}
+
+	sa = *sap;
+	if (sa.sa_magic == BSWAP_32(SA_MAGIC)) {
+		sa.sa_magic = SA_MAGIC;
+		sa.sa_layout_info = BSWAP_16(sa.sa_layout_info);
+		swap = B_TRUE;
 	} else {
-		int hdrsize;
-		sa_hdr_phys_t *sap = data;
-		sa_hdr_phys_t sa = *sap;
-		boolean_t swap = B_FALSE;
+		VERIFY3U(sa.sa_magic, ==, SA_MAGIC);
+	}
 
-		ASSERT(bonustype == DMU_OT_SA);
+	hdrsize = sa_hdrsize(&sa);
+	VERIFY3U(hdrsize, >=, sizeof (sa_hdr_phys_t));
 
-		if (sa.sa_magic == 0) {
-			/*
-			 * This should only happen for newly created
-			 * files that haven't had the znode data filled
-			 * in yet.
-			 */
-			*userp = 0;
-			*groupp = 0;
-			return (0);
-		}
-		if (sa.sa_magic == BSWAP_32(SA_MAGIC)) {
-			sa.sa_magic = SA_MAGIC;
-			sa.sa_layout_info = BSWAP_16(sa.sa_layout_info);
-			swap = B_TRUE;
-		} else {
-			VERIFY3U(sa.sa_magic, ==, SA_MAGIC);
-		}
+	*userp = *((uint64_t *)((uintptr_t)data + hdrsize + SA_UID_OFFSET));
+	*groupp = *((uint64_t *)((uintptr_t)data + hdrsize + SA_GID_OFFSET));
+	flags = *((uint64_t *)((uintptr_t)data + hdrsize + SA_FLAGS_OFFSET));
+	if (swap)
+		flags = BSWAP_64(flags);
 
-		hdrsize = sa_hdrsize(&sa);
-		VERIFY3U(hdrsize, >=, sizeof (sa_hdr_phys_t));
-		*userp = *((uint64_t *)((uintptr_t)data + hdrsize +
-		    SA_UID_OFFSET));
-		*groupp = *((uint64_t *)((uintptr_t)data + hdrsize +
-		    SA_GID_OFFSET));
-		if (swap) {
-			*userp = BSWAP_64(*userp);
-			*groupp = BSWAP_64(*groupp);
-		}
+	if (flags & ZFS_PROJID)
+		*projectp = *((uint64_t *)((uintptr_t)data + hdrsize +
+		    SA_PROJID_OFFSET));
+	else
+		*projectp = ZFS_DEFAULT_PROJID;
+
+	if (swap) {
+		*userp = BSWAP_64(*userp);
+		*groupp = BSWAP_64(*groupp);
+		*projectp = BSWAP_64(*projectp);
 	}
 	return (0);
 }
@@ -624,6 +627,9 @@ zfs_userquota_prop_to_obj(zfsvfs_t *zfsvfs, zfs_userquota_prop_t type)
 	case ZFS_PROP_GROUPUSED:
 	case ZFS_PROP_GROUPOBJUSED:
 		return (DMU_GROUPUSED_OBJECT);
+	case ZFS_PROP_PROJECTUSED:
+	case ZFS_PROP_PROJECTOBJUSED:
+		return (DMU_PROJECTUSED_OBJECT);
 	case ZFS_PROP_USERQUOTA:
 		return (zfsvfs->z_userquota_obj);
 	case ZFS_PROP_GROUPQUOTA:
@@ -632,6 +638,10 @@ zfs_userquota_prop_to_obj(zfsvfs_t *zfsvfs, zfs_userquota_prop_t type)
 		return (zfsvfs->z_userobjquota_obj);
 	case ZFS_PROP_GROUPOBJQUOTA:
 		return (zfsvfs->z_groupobjquota_obj);
+	case ZFS_PROP_PROJECTQUOTA:
+		return (zfsvfs->z_projectquota_obj);
+	case ZFS_PROP_PROJECTOBJQUOTA:
+		return (zfsvfs->z_projectobjquota_obj);
 	default:
 		return (ZFS_NO_OBJECT);
 	}
@@ -651,8 +661,16 @@ zfs_userspace_many(zfsvfs_t *zfsvfs, zfs_userquota_prop_t type,
 	if (!dmu_objset_userspace_present(zfsvfs->z_os))
 		return (SET_ERROR(ENOTSUP));
 
+	if ((type == ZFS_PROP_PROJECTQUOTA || type == ZFS_PROP_PROJECTUSED ||
+	    type == ZFS_PROP_PROJECTOBJQUOTA ||
+	    type == ZFS_PROP_PROJECTOBJUSED) &&
+	    !dmu_objset_projectquota_present(zfsvfs->z_os))
+		return (SET_ERROR(ENOTSUP));
+
 	if ((type == ZFS_PROP_USEROBJUSED || type == ZFS_PROP_GROUPOBJUSED ||
-	    type == ZFS_PROP_USEROBJQUOTA || type == ZFS_PROP_GROUPOBJQUOTA) &&
+	    type == ZFS_PROP_USEROBJQUOTA || type == ZFS_PROP_GROUPOBJQUOTA ||
+	    type == ZFS_PROP_PROJECTOBJUSED ||
+	    type == ZFS_PROP_PROJECTOBJQUOTA) &&
 	    !dmu_objset_userobjspace_present(zfsvfs->z_os))
 		return (SET_ERROR(ENOTSUP));
 
@@ -662,7 +680,8 @@ zfs_userspace_many(zfsvfs_t *zfsvfs, zfs_userquota_prop_t type,
 		return (0);
 	}
 
-	if (type == ZFS_PROP_USEROBJUSED || type == ZFS_PROP_GROUPOBJUSED)
+	if (type == ZFS_PROP_USEROBJUSED || type == ZFS_PROP_GROUPOBJUSED ||
+	    type == ZFS_PROP_PROJECTOBJUSED)
 		offset = DMU_OBJACCT_PREFIX_LEN;
 
 	for (zap_cursor_init_serialized(&zc, zfsvfs->z_os, obj, *cookiep);
@@ -731,15 +750,27 @@ zfs_userspace_one(zfsvfs_t *zfsvfs, zfs_userquota_prop_t type,
 		return (SET_ERROR(ENOTSUP));
 
 	if ((type == ZFS_PROP_USEROBJUSED || type == ZFS_PROP_GROUPOBJUSED ||
-	    type == ZFS_PROP_USEROBJQUOTA || type == ZFS_PROP_GROUPOBJQUOTA) &&
+	    type == ZFS_PROP_USEROBJQUOTA || type == ZFS_PROP_GROUPOBJQUOTA ||
+	    type == ZFS_PROP_PROJECTOBJUSED ||
+	    type == ZFS_PROP_PROJECTOBJQUOTA) &&
 	    !dmu_objset_userobjspace_present(zfsvfs->z_os))
 		return (SET_ERROR(ENOTSUP));
+
+	if (type == ZFS_PROP_PROJECTQUOTA || type == ZFS_PROP_PROJECTUSED ||
+	    type == ZFS_PROP_PROJECTOBJQUOTA ||
+	    type == ZFS_PROP_PROJECTOBJUSED) {
+		if (!dmu_objset_projectquota_present(zfsvfs->z_os))
+			return (SET_ERROR(ENOTSUP));
+		if (!zpl_is_valid_projid(rid))
+			return (SET_ERROR(EINVAL));
+	}
 
 	obj = zfs_userquota_prop_to_obj(zfsvfs, type);
 	if (obj == ZFS_NO_OBJECT)
 		return (0);
 
-	if (type == ZFS_PROP_USEROBJUSED || type == ZFS_PROP_GROUPOBJUSED) {
+	if (type == ZFS_PROP_USEROBJUSED || type == ZFS_PROP_GROUPOBJUSED ||
+	    type == ZFS_PROP_PROJECTOBJUSED) {
 		strlcpy(buf, DMU_OBJACCT_PREFIX, DMU_OBJACCT_PREFIX_LEN + 1);
 		offset = DMU_OBJACCT_PREFIX_LEN;
 	}
@@ -779,6 +810,22 @@ zfs_set_userquota(zfsvfs_t *zfsvfs, zfs_userquota_prop_t type,
 		break;
 	case ZFS_PROP_GROUPOBJQUOTA:
 		objp = &zfsvfs->z_groupobjquota_obj;
+		break;
+	case ZFS_PROP_PROJECTQUOTA:
+		if (!dmu_objset_projectquota_enabled(zfsvfs->z_os))
+			return (SET_ERROR(ENOTSUP));
+		if (!zpl_is_valid_projid(rid))
+			return (SET_ERROR(EINVAL));
+
+		objp = &zfsvfs->z_projectquota_obj;
+		break;
+	case ZFS_PROP_PROJECTOBJQUOTA:
+		if (!dmu_objset_projectquota_enabled(zfsvfs->z_os))
+			return (SET_ERROR(ENOTSUP));
+		if (!zpl_is_valid_projid(rid))
+			return (SET_ERROR(EINVAL));
+
+		objp = &zfsvfs->z_projectobjquota_obj;
 		break;
 	default:
 		return (SET_ERROR(EINVAL));
@@ -827,30 +874,51 @@ zfs_set_userquota(zfsvfs_t *zfsvfs, zfs_userquota_prop_t type,
 }
 
 boolean_t
-zfs_fuid_overobjquota(zfsvfs_t *zfsvfs, boolean_t isgroup, uint64_t fuid)
+zfs_id_overobjquota(zfsvfs_t *zfsvfs, uint64_t usedobj, uint64_t id)
 {
 	char buf[20 + DMU_OBJACCT_PREFIX_LEN];
-	uint64_t used, quota, usedobj, quotaobj;
+	uint64_t used, quota, quotaobj;
 	int err;
 
 	if (!dmu_objset_userobjspace_present(zfsvfs->z_os)) {
-		if (dmu_objset_userobjspace_upgradable(zfsvfs->z_os))
-			dmu_objset_userobjspace_upgrade(zfsvfs->z_os);
+		if (dmu_objset_userobjspace_upgradable(zfsvfs->z_os)) {
+			dsl_pool_config_enter(
+			    dmu_objset_pool(zfsvfs->z_os), FTAG);
+			dmu_objset_id_quota_upgrade(zfsvfs->z_os);
+			dsl_pool_config_exit(
+			    dmu_objset_pool(zfsvfs->z_os), FTAG);
+		}
 		return (B_FALSE);
 	}
 
-	usedobj = isgroup ? DMU_GROUPUSED_OBJECT : DMU_USERUSED_OBJECT;
-	quotaobj = isgroup ? zfsvfs->z_groupobjquota_obj :
-	    zfsvfs->z_userobjquota_obj;
+	if (usedobj == DMU_PROJECTUSED_OBJECT) {
+		if (!dmu_objset_projectquota_present(zfsvfs->z_os)) {
+			if (dmu_objset_projectquota_upgradable(zfsvfs->z_os)) {
+				dsl_pool_config_enter(
+				    dmu_objset_pool(zfsvfs->z_os), FTAG);
+				dmu_objset_id_quota_upgrade(zfsvfs->z_os);
+				dsl_pool_config_exit(
+				    dmu_objset_pool(zfsvfs->z_os), FTAG);
+			}
+			return (B_FALSE);
+		}
+		quotaobj = zfsvfs->z_projectobjquota_obj;
+	} else if (usedobj == DMU_USERUSED_OBJECT) {
+		quotaobj = zfsvfs->z_userobjquota_obj;
+	} else if (usedobj == DMU_GROUPUSED_OBJECT) {
+		quotaobj = zfsvfs->z_groupobjquota_obj;
+	} else {
+		return (B_FALSE);
+	}
 	if (quotaobj == 0 || zfsvfs->z_replay)
 		return (B_FALSE);
 
-	(void) sprintf(buf, "%llx", (longlong_t)fuid);
+	(void) sprintf(buf, "%llx", (longlong_t)id);
 	err = zap_lookup(zfsvfs->z_os, quotaobj, buf, 8, 1, &quota);
 	if (err != 0)
 		return (B_FALSE);
 
-	(void) sprintf(buf, DMU_OBJACCT_PREFIX "%llx", (longlong_t)fuid);
+	(void) sprintf(buf, DMU_OBJACCT_PREFIX "%llx", (longlong_t)id);
 	err = zap_lookup(zfsvfs->z_os, usedobj, buf, 8, 1, &used);
 	if (err != 0)
 		return (B_FALSE);
@@ -858,19 +926,35 @@ zfs_fuid_overobjquota(zfsvfs_t *zfsvfs, boolean_t isgroup, uint64_t fuid)
 }
 
 boolean_t
-zfs_fuid_overquota(zfsvfs_t *zfsvfs, boolean_t isgroup, uint64_t fuid)
+zfs_id_overblockquota(zfsvfs_t *zfsvfs, uint64_t usedobj, uint64_t id)
 {
 	char buf[20];
-	uint64_t used, quota, usedobj, quotaobj;
+	uint64_t used, quota, quotaobj;
 	int err;
 
-	usedobj = isgroup ? DMU_GROUPUSED_OBJECT : DMU_USERUSED_OBJECT;
-	quotaobj = isgroup ? zfsvfs->z_groupquota_obj : zfsvfs->z_userquota_obj;
-
+	if (usedobj == DMU_PROJECTUSED_OBJECT) {
+		if (!dmu_objset_projectquota_present(zfsvfs->z_os)) {
+			if (dmu_objset_projectquota_upgradable(zfsvfs->z_os)) {
+				dsl_pool_config_enter(
+				    dmu_objset_pool(zfsvfs->z_os), FTAG);
+				dmu_objset_id_quota_upgrade(zfsvfs->z_os);
+				dsl_pool_config_exit(
+				    dmu_objset_pool(zfsvfs->z_os), FTAG);
+			}
+			return (B_FALSE);
+		}
+		quotaobj = zfsvfs->z_projectquota_obj;
+	} else if (usedobj == DMU_USERUSED_OBJECT) {
+		quotaobj = zfsvfs->z_userquota_obj;
+	} else if (usedobj == DMU_GROUPUSED_OBJECT) {
+		quotaobj = zfsvfs->z_groupquota_obj;
+	} else {
+		return (B_FALSE);
+	}
 	if (quotaobj == 0 || zfsvfs->z_replay)
 		return (B_FALSE);
 
-	(void) sprintf(buf, "%llx", (longlong_t)fuid);
+	(void) sprintf(buf, "%llx", (longlong_t)id);
 	err = zap_lookup(zfsvfs->z_os, quotaobj, buf, 8, 1, &quota);
 	if (err != 0)
 		return (B_FALSE);
@@ -882,20 +966,10 @@ zfs_fuid_overquota(zfsvfs_t *zfsvfs, boolean_t isgroup, uint64_t fuid)
 }
 
 boolean_t
-zfs_owner_overquota(zfsvfs_t *zfsvfs, znode_t *zp, boolean_t isgroup)
+zfs_id_overquota(zfsvfs_t *zfsvfs, uint64_t usedobj, uint64_t id)
 {
-	uint64_t fuid;
-	uint64_t quotaobj;
-	struct inode *ip = ZTOI(zp);
-
-	quotaobj = isgroup ? zfsvfs->z_groupquota_obj : zfsvfs->z_userquota_obj;
-
-	fuid = isgroup ? KGID_TO_SGID(ip->i_gid) : KUID_TO_SUID(ip->i_uid);
-
-	if (quotaobj == 0 || zfsvfs->z_replay)
-		return (B_FALSE);
-
-	return (zfs_fuid_overquota(zfsvfs, isgroup, fuid));
+	return (zfs_id_overblockquota(zfsvfs, usedobj, id) ||
+	    zfs_id_overobjquota(zfsvfs, usedobj, id));
 }
 
 /*
@@ -1003,6 +1077,14 @@ zfsvfs_init(zfsvfs_t *zfsvfs, objset_t *os)
 		return (error);
 
 	error = zap_lookup(os, MASTER_NODE_OBJ,
+	    zfs_userquota_prop_prefixes[ZFS_PROP_PROJECTQUOTA],
+	    8, 1, &zfsvfs->z_projectquota_obj);
+	if (error == ENOENT)
+		zfsvfs->z_projectquota_obj = 0;
+	else if (error != 0)
+		return (error);
+
+	error = zap_lookup(os, MASTER_NODE_OBJ,
 	    zfs_userquota_prop_prefixes[ZFS_PROP_USEROBJQUOTA],
 	    8, 1, &zfsvfs->z_userobjquota_obj);
 	if (error == ENOENT)
@@ -1015,6 +1097,14 @@ zfsvfs_init(zfsvfs_t *zfsvfs, objset_t *os)
 	    8, 1, &zfsvfs->z_groupobjquota_obj);
 	if (error == ENOENT)
 		zfsvfs->z_groupobjquota_obj = 0;
+	else if (error != 0)
+		return (error);
+
+	error = zap_lookup(os, MASTER_NODE_OBJ,
+	    zfs_userquota_prop_prefixes[ZFS_PROP_PROJECTOBJQUOTA],
+	    8, 1, &zfsvfs->z_projectobjquota_obj);
+	if (error == ENOENT)
+		zfsvfs->z_projectobjquota_obj = 0;
 	else if (error != 0)
 		return (error);
 
@@ -1036,23 +1126,32 @@ zfsvfs_init(zfsvfs_t *zfsvfs, objset_t *os)
 }
 
 int
-zfsvfs_create(const char *osname, zfsvfs_t **zfvp)
+zfsvfs_create(const char *osname, boolean_t readonly, zfsvfs_t **zfvp)
 {
 	objset_t *os;
 	zfsvfs_t *zfsvfs;
 	int error;
+	boolean_t ro = (readonly || (strchr(osname, '@') != NULL));
 
 	zfsvfs = kmem_zalloc(sizeof (zfsvfs_t), KM_SLEEP);
 
-	/*
-	 * We claim to always be readonly so we can open snapshots;
-	 * other ZPL code will prevent us from writing to snapshots.
-	 */
-	error = dmu_objset_own(osname, DMU_OST_ZFS, B_TRUE, zfsvfs, &os);
-	if (error) {
+	error = dmu_objset_own(osname, DMU_OST_ZFS, ro, B_TRUE, zfsvfs, &os);
+	if (error != 0) {
 		kmem_free(zfsvfs, sizeof (zfsvfs_t));
 		return (error);
 	}
+
+	error = zfsvfs_create_impl(zfvp, zfsvfs, os);
+	if (error != 0) {
+		dmu_objset_disown(os, B_TRUE, zfsvfs);
+	}
+	return (error);
+}
+
+int
+zfsvfs_create_impl(zfsvfs_t **zfvp, zfsvfs_t *zfsvfs, objset_t *os)
+{
+	int error;
 
 	zfsvfs->z_vfs = NULL;
 	zfsvfs->z_sb = NULL;
@@ -1080,7 +1179,6 @@ zfsvfs_create(const char *osname, zfsvfs_t **zfvp)
 
 	error = zfsvfs_init(zfsvfs, os);
 	if (error != 0) {
-		dmu_objset_disown(os, zfsvfs);
 		*zfvp = NULL;
 		kmem_free(zfsvfs, sizeof (zfsvfs_t));
 		return (error);
@@ -1094,6 +1192,7 @@ static int
 zfsvfs_setup(zfsvfs_t *zfsvfs, boolean_t mounting)
 {
 	int error;
+	boolean_t readonly = zfs_is_readonly(zfsvfs);
 
 	error = zfs_register_callbacks(zfsvfs->z_vfs);
 	if (error)
@@ -1107,13 +1206,10 @@ zfsvfs_setup(zfsvfs_t *zfsvfs, boolean_t mounting)
 	 * operations out since we closed the ZIL.
 	 */
 	if (mounting) {
-		boolean_t readonly;
-
 		/*
 		 * During replay we remove the read only flag to
 		 * allow replays to succeed.
 		 */
-		readonly = zfs_is_readonly(zfsvfs);
 		if (readonly != 0)
 			readonly_changed_cb(zfsvfs, B_FALSE);
 		else
@@ -1160,6 +1256,9 @@ zfsvfs_setup(zfsvfs_t *zfsvfs, boolean_t mounting)
 		/* restore readonly bit */
 		if (readonly != 0)
 			readonly_changed_cb(zfsvfs, B_TRUE);
+
+		ASSERT3P(zfsvfs->z_kstat.dk_kstats, ==, NULL);
+		dataset_kstats_create(&zfsvfs->z_kstat, zfsvfs->z_os);
 	}
 
 	/*
@@ -1192,6 +1291,7 @@ zfsvfs_free(zfsvfs_t *zfsvfs)
 	vmem_free(zfsvfs->z_hold_trees, sizeof (avl_tree_t) * size);
 	vmem_free(zfsvfs->z_hold_locks, sizeof (kmutex_t) * size);
 	zfsvfs_vfs_free(zfsvfs->z_vfs);
+	dataset_kstats_destroy(&zfsvfs->z_kstat);
 	kmem_free(zfsvfs, sizeof (zfsvfs_t));
 }
 
@@ -1240,20 +1340,96 @@ zfs_check_global_label(const char *dsname, const char *hexsl)
 }
 #endif /* HAVE_MLSLABEL */
 
+static int
+zfs_statfs_project(zfsvfs_t *zfsvfs, znode_t *zp, struct kstatfs *statp,
+    uint32_t bshift)
+{
+	char buf[20 + DMU_OBJACCT_PREFIX_LEN];
+	uint64_t offset = DMU_OBJACCT_PREFIX_LEN;
+	uint64_t quota;
+	uint64_t used;
+	int err;
+
+	strlcpy(buf, DMU_OBJACCT_PREFIX, DMU_OBJACCT_PREFIX_LEN + 1);
+	err = id_to_fuidstr(zfsvfs, NULL, zp->z_projid, buf + offset, B_FALSE);
+	if (err)
+		return (err);
+
+	if (zfsvfs->z_projectquota_obj == 0)
+		goto objs;
+
+	err = zap_lookup(zfsvfs->z_os, zfsvfs->z_projectquota_obj,
+	    buf + offset, 8, 1, &quota);
+	if (err == ENOENT)
+		goto objs;
+	else if (err)
+		return (err);
+
+	err = zap_lookup(zfsvfs->z_os, DMU_PROJECTUSED_OBJECT,
+	    buf + offset, 8, 1, &used);
+	if (unlikely(err == ENOENT)) {
+		uint32_t blksize;
+		u_longlong_t nblocks;
+
+		/*
+		 * Quota accounting is async, so it is possible race case.
+		 * There is at least one object with the given project ID.
+		 */
+		sa_object_size(zp->z_sa_hdl, &blksize, &nblocks);
+		if (unlikely(zp->z_blksz == 0))
+			blksize = zfsvfs->z_max_blksz;
+
+		used = blksize * nblocks;
+	} else if (err) {
+		return (err);
+	}
+
+	statp->f_blocks = quota >> bshift;
+	statp->f_bfree = (quota > used) ? ((quota - used) >> bshift) : 0;
+	statp->f_bavail = statp->f_bfree;
+
+objs:
+	if (zfsvfs->z_projectobjquota_obj == 0)
+		return (0);
+
+	err = zap_lookup(zfsvfs->z_os, zfsvfs->z_projectobjquota_obj,
+	    buf + offset, 8, 1, &quota);
+	if (err == ENOENT)
+		return (0);
+	else if (err)
+		return (err);
+
+	err = zap_lookup(zfsvfs->z_os, DMU_PROJECTUSED_OBJECT,
+	    buf, 8, 1, &used);
+	if (unlikely(err == ENOENT)) {
+		/*
+		 * Quota accounting is async, so it is possible race case.
+		 * There is at least one object with the given project ID.
+		 */
+		used = 1;
+	} else if (err) {
+		return (err);
+	}
+
+	statp->f_files = quota;
+	statp->f_ffree = (quota > used) ? (quota - used) : 0;
+
+	return (0);
+}
+
 int
 zfs_statvfs(struct dentry *dentry, struct kstatfs *statp)
 {
 	zfsvfs_t *zfsvfs = dentry->d_sb->s_fs_info;
 	uint64_t refdbytes, availbytes, usedobjs, availobjs;
-	uint64_t fsid;
-	uint32_t bshift;
+	int err = 0;
 
 	ZFS_ENTER(zfsvfs);
 
 	dmu_objset_space(zfsvfs->z_os,
 	    &refdbytes, &availbytes, &usedobjs, &availobjs);
 
-	fsid = dmu_objset_fsid_guid(zfsvfs->z_os);
+	uint64_t fsid = dmu_objset_fsid_guid(zfsvfs->z_os);
 	/*
 	 * The underlying storage pool actually uses multiple block
 	 * size.  Under Solaris frsize (fragment size) is reported as
@@ -1265,7 +1441,7 @@ zfs_statvfs(struct dentry *dentry, struct kstatfs *statp)
 	 */
 	statp->f_frsize = zfsvfs->z_max_blksz;
 	statp->f_bsize = zfsvfs->z_max_blksz;
-	bshift = fls(statp->f_bsize) - 1;
+	uint32_t bshift = fls(statp->f_bsize) - 1;
 
 	/*
 	 * The following report "total" blocks of various kinds in
@@ -1282,7 +1458,7 @@ zfs_statvfs(struct dentry *dentry, struct kstatfs *statp)
 	 * static metadata.  ZFS doesn't preallocate files, so the best
 	 * we can do is report the max that could possibly fit in f_files,
 	 * and that minus the number actually used in f_ffree.
-	 * For f_ffree, report the smaller of the number of object available
+	 * For f_ffree, report the smaller of the number of objects available
 	 * and the number of blocks (each object will take at least a block).
 	 */
 	statp->f_ffree = MIN(availobjs, availbytes >> DNODE_SHIFT);
@@ -1298,8 +1474,17 @@ zfs_statvfs(struct dentry *dentry, struct kstatfs *statp)
 	 */
 	bzero(statp->f_spare, sizeof (statp->f_spare));
 
+	if (dmu_objset_projectquota_enabled(zfsvfs->z_os) &&
+	    dmu_objset_projectquota_present(zfsvfs->z_os)) {
+		znode_t *zp = ITOZ(dentry->d_inode);
+
+		if (zp->z_pflags & ZFS_PROJINHERIT && zp->z_projid &&
+		    zpl_is_valid_projid(zp->z_projid))
+			err = zfs_statfs_project(zfsvfs, zp, statp, bshift);
+	}
+
 	ZFS_EXIT(zfsvfs);
-	return (0);
+	return (err);
 }
 
 int
@@ -1558,10 +1743,10 @@ zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting)
 	zfs_unregister_callbacks(zfsvfs);
 
 	/*
-	 * Evict cached data
+	 * Evict cached data. We must write out any dirty data before
+	 * disowning the dataset.
 	 */
-	if (dsl_dataset_is_dirty(dmu_objset_ds(zfsvfs->z_os)) &&
-	    !zfs_is_readonly(zfsvfs))
+	if (!zfs_is_readonly(zfsvfs))
 		txg_wait_synced(dmu_objset_pool(zfsvfs->z_os), 0);
 	dmu_objset_evict_dbufs(zfsvfs->z_os);
 
@@ -1580,24 +1765,30 @@ zfs_domount(struct super_block *sb, zfs_mnt_t *zm, int silent)
 	struct inode *root_inode;
 	uint64_t recordsize;
 	int error = 0;
-	zfsvfs_t *zfsvfs;
+	zfsvfs_t *zfsvfs = NULL;
+	vfs_t *vfs = NULL;
 
 	ASSERT(zm);
 	ASSERT(osname);
 
-	error = zfsvfs_create(osname, &zfsvfs);
+	error = zfsvfs_parse_options(zm->mnt_data, &vfs);
 	if (error)
 		return (error);
 
-	error = zfsvfs_parse_options(zm->mnt_data, &zfsvfs->z_vfs);
-	if (error)
+	error = zfsvfs_create(osname, vfs->vfs_readonly, &zfsvfs);
+	if (error) {
+		zfsvfs_vfs_free(vfs);
 		goto out;
+	}
 
 	if ((error = dsl_prop_get_integer(osname, "recordsize",
-	    &recordsize, NULL)))
+	    &recordsize, NULL))) {
+		zfsvfs_vfs_free(vfs);
 		goto out;
+	}
 
-	zfsvfs->z_vfs->vfs_data = zfsvfs;
+	vfs->vfs_data = zfsvfs;
+	zfsvfs->z_vfs = vfs;
 	zfsvfs->z_sb = sb;
 	sb->s_fs_info = zfsvfs;
 	sb->s_magic = ZFS_SUPER_MAGIC;
@@ -1669,8 +1860,10 @@ zfs_domount(struct super_block *sb, zfs_mnt_t *zm, int silent)
 	zfsvfs->z_arc_prune = arc_add_prune_callback(zpl_prune_sb, sb);
 out:
 	if (error) {
-		dmu_objset_disown(zfsvfs->z_os, zfsvfs);
-		zfsvfs_free(zfsvfs);
+		if (zfsvfs != NULL) {
+			dmu_objset_disown(zfsvfs->z_os, B_TRUE, zfsvfs);
+			zfsvfs_free(zfsvfs);
+		}
 		/*
 		 * make sure we don't have dangling sb->s_fs_info which
 		 * zfs_preumount will use.
@@ -1729,7 +1922,8 @@ zfs_umount(struct super_block *sb)
 	zfsvfs_t *zfsvfs = sb->s_fs_info;
 	objset_t *os;
 
-	arc_remove_prune_callback(zfsvfs->z_arc_prune);
+	if (zfsvfs->z_arc_prune != NULL)
+		arc_remove_prune_callback(zfsvfs->z_arc_prune);
 	VERIFY(zfsvfs_teardown(zfsvfs, B_TRUE) == 0);
 	os = zfsvfs->z_os;
 	zpl_bdi_destroy(sb);
@@ -1749,7 +1943,7 @@ zfs_umount(struct super_block *sb)
 		/*
 		 * Finally release the objset
 		 */
-		dmu_objset_disown(os, zfsvfs);
+		dmu_objset_disown(os, B_TRUE, zfsvfs);
 	}
 
 	zfsvfs_free(zfsvfs);
@@ -1773,6 +1967,9 @@ zfs_remount(struct super_block *sb, int *flags, zfs_mnt_t *zm)
 	error = zfsvfs_parse_options(zm->mnt_data, &vfsp);
 	if (error)
 		return (error);
+
+	if (!zfs_is_readonly(zfsvfs) && (*flags & MS_RDONLY))
+		txg_wait_synced(dmu_objset_pool(zfsvfs->z_os), 0);
 
 	zfs_unregister_callbacks(zfsvfs);
 	zfsvfs_vfs_free(zfsvfs->z_vfs);
@@ -2042,6 +2239,7 @@ zfs_set_version(zfsvfs_t *zfsvfs, uint64_t newvers)
 	dmu_tx_commit(tx);
 
 	zfsvfs->z_version = newvers;
+	os->os_version = newvers;
 
 	zfs_set_fuid_feature(zfsvfs);
 
@@ -2054,13 +2252,42 @@ zfs_set_version(zfsvfs_t *zfsvfs, uint64_t newvers)
 int
 zfs_get_zplprop(objset_t *os, zfs_prop_t prop, uint64_t *value)
 {
-	const char *pname;
-	int error = SET_ERROR(ENOENT);
+	uint64_t *cached_copy = NULL;
 
 	/*
-	 * Look up the file system's value for the property.  For the
-	 * version property, we look up a slightly different string.
+	 * Figure out where in the objset_t the cached copy would live, if it
+	 * is available for the requested property.
 	 */
+	if (os != NULL) {
+		switch (prop) {
+		case ZFS_PROP_VERSION:
+			cached_copy = &os->os_version;
+			break;
+		case ZFS_PROP_NORMALIZE:
+			cached_copy = &os->os_normalization;
+			break;
+		case ZFS_PROP_UTF8ONLY:
+			cached_copy = &os->os_utf8only;
+			break;
+		case ZFS_PROP_CASE:
+			cached_copy = &os->os_casesensitivity;
+			break;
+		default:
+			break;
+		}
+	}
+	if (cached_copy != NULL && *cached_copy != OBJSET_PROP_UNINITIALIZED) {
+		*value = *cached_copy;
+		return (0);
+	}
+
+	/*
+	 * If the property wasn't cached, look up the file system's value for
+	 * the property. For the version property, we look up a slightly
+	 * different string.
+	 */
+	const char *pname;
+	int error = ENOENT;
 	if (prop == ZFS_PROP_VERSION)
 		pname = ZPL_VERSION_STR;
 	else
@@ -2092,6 +2319,15 @@ zfs_get_zplprop(objset_t *os, zfs_prop_t prop, uint64_t *value)
 		}
 		error = 0;
 	}
+
+	/*
+	 * If one of the methods for getting the property value above worked,
+	 * copy it into the objset_t's cache.
+	 */
+	if (error == 0 && cached_copy != NULL) {
+		*cached_copy = *value;
+	}
+
 	return (error);
 }
 
@@ -2139,15 +2375,15 @@ zfs_fini(void)
 	zfsctl_fini();
 }
 
-#if defined(_KERNEL) && defined(HAVE_SPL)
+#if defined(_KERNEL)
 EXPORT_SYMBOL(zfs_suspend_fs);
 EXPORT_SYMBOL(zfs_resume_fs);
 EXPORT_SYMBOL(zfs_userspace_one);
 EXPORT_SYMBOL(zfs_userspace_many);
 EXPORT_SYMBOL(zfs_set_userquota);
-EXPORT_SYMBOL(zfs_owner_overquota);
-EXPORT_SYMBOL(zfs_fuid_overquota);
-EXPORT_SYMBOL(zfs_fuid_overobjquota);
+EXPORT_SYMBOL(zfs_id_overblockquota);
+EXPORT_SYMBOL(zfs_id_overobjquota);
+EXPORT_SYMBOL(zfs_id_overquota);
 EXPORT_SYMBOL(zfs_set_version);
 EXPORT_SYMBOL(zfsvfs_create);
 EXPORT_SYMBOL(zfsvfs_free);

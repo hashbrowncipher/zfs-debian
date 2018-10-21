@@ -21,8 +21,8 @@
 
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2013, Joyent, Inc. All rights reserved.
- * Copyright (c) 2011, 2014 by Delphix. All rights reserved.
+ * Copyright (c) 2018, Joyent, Inc. All rights reserved.
+ * Copyright (c) 2011, 2018 by Delphix. All rights reserved.
  * Copyright 2016 Igor Kozhukhov <ikozhukhov@gmail.com>
  * Copyright (c) 2017 Datto Inc.
  */
@@ -227,6 +227,9 @@ libzfs_error_description(libzfs_handle_t *hdl)
 	case EZFS_NOTSUP:
 		return (dgettext(TEXT_DOMAIN, "operation not supported "
 		    "on this dataset"));
+	case EZFS_IOC_NOTSUPPORTED:
+		return (dgettext(TEXT_DOMAIN, "operation not supported by "
+		    "zfs kernel module"));
 	case EZFS_ACTIVE_SPARE:
 		return (dgettext(TEXT_DOMAIN, "pool has active shared spare "
 		    "device"));
@@ -261,9 +264,25 @@ libzfs_error_description(libzfs_handle_t *hdl)
 		return (dgettext(TEXT_DOMAIN, "invalid diff data"));
 	case EZFS_POOLREADONLY:
 		return (dgettext(TEXT_DOMAIN, "pool is read-only"));
+	case EZFS_NO_PENDING:
+		return (dgettext(TEXT_DOMAIN, "operation is not "
+		    "in progress"));
+	case EZFS_CHECKPOINT_EXISTS:
+		return (dgettext(TEXT_DOMAIN, "checkpoint exists"));
+	case EZFS_DISCARDING_CHECKPOINT:
+		return (dgettext(TEXT_DOMAIN, "currently discarding "
+		    "checkpoint"));
+	case EZFS_NO_CHECKPOINT:
+		return (dgettext(TEXT_DOMAIN, "checkpoint does not exist"));
+	case EZFS_DEVRM_IN_PROGRESS:
+		return (dgettext(TEXT_DOMAIN, "device removal in progress"));
+	case EZFS_VDEV_TOO_BIG:
+		return (dgettext(TEXT_DOMAIN, "device exceeds supported size"));
 	case EZFS_ACTIVE_POOL:
 		return (dgettext(TEXT_DOMAIN, "pool is imported on a "
 		    "different host"));
+	case EZFS_CRYPTOFAILED:
+		return (dgettext(TEXT_DOMAIN, "encryption failure"));
 	case EZFS_UNKNOWN:
 		return (dgettext(TEXT_DOMAIN, "unknown error"));
 	default:
@@ -429,6 +448,22 @@ zfs_standard_error_fmt(libzfs_handle_t *hdl, int error, const char *fmt, ...)
 	case EREMOTEIO:
 		zfs_verror(hdl, EZFS_ACTIVE_POOL, fmt, ap);
 		break;
+	case ZFS_ERR_IOC_CMD_UNAVAIL:
+		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN, "the loaded zfs "
+		    "module does not support this operation. A reboot may "
+		    "be required to enable this operation."));
+		zfs_verror(hdl, EZFS_IOC_NOTSUPPORTED, fmt, ap);
+		break;
+	case ZFS_ERR_IOC_ARG_UNAVAIL:
+		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN, "the loaded zfs "
+		    "module does not support an option for this operation. "
+		    "A reboot may be required to enable this option."));
+		zfs_verror(hdl, EZFS_IOC_NOTSUPPORTED, fmt, ap);
+		break;
+	case ZFS_ERR_IOC_ARG_REQUIRED:
+	case ZFS_ERR_IOC_ARG_BADTYPE:
+		zfs_verror(hdl, EZFS_IOC_NOTSUPPORTED, fmt, ap);
+		break;
 	default:
 		zfs_error_aux(hdl, strerror(error));
 		zfs_verror(hdl, EZFS_UNKNOWN, fmt, ap);
@@ -480,6 +515,11 @@ zpool_standard_error_fmt(libzfs_handle_t *hdl, int error, const char *fmt, ...)
 		zfs_verror(hdl, EZFS_BUSY, fmt, ap);
 		break;
 
+	/* There is no pending operation to cancel */
+	case ENOTACTIVE:
+		zfs_verror(hdl, EZFS_NO_PENDING, fmt, ap);
+		break;
+
 	case ENXIO:
 		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
 		    "one or more devices is currently unavailable"));
@@ -520,7 +560,37 @@ zpool_standard_error_fmt(libzfs_handle_t *hdl, int error, const char *fmt, ...)
 	case EREMOTEIO:
 		zfs_verror(hdl, EZFS_ACTIVE_POOL, fmt, ap);
 		break;
-
+	case ZFS_ERR_CHECKPOINT_EXISTS:
+		zfs_verror(hdl, EZFS_CHECKPOINT_EXISTS, fmt, ap);
+		break;
+	case ZFS_ERR_DISCARDING_CHECKPOINT:
+		zfs_verror(hdl, EZFS_DISCARDING_CHECKPOINT, fmt, ap);
+		break;
+	case ZFS_ERR_NO_CHECKPOINT:
+		zfs_verror(hdl, EZFS_NO_CHECKPOINT, fmt, ap);
+		break;
+	case ZFS_ERR_DEVRM_IN_PROGRESS:
+		zfs_verror(hdl, EZFS_DEVRM_IN_PROGRESS, fmt, ap);
+		break;
+	case ZFS_ERR_VDEV_TOO_BIG:
+		zfs_verror(hdl, EZFS_VDEV_TOO_BIG, fmt, ap);
+		break;
+	case ZFS_ERR_IOC_CMD_UNAVAIL:
+		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN, "the loaded zfs "
+		    "module does not support this operation. A reboot may "
+		    "be required to enable this operation."));
+		zfs_verror(hdl, EZFS_IOC_NOTSUPPORTED, fmt, ap);
+		break;
+	case ZFS_ERR_IOC_ARG_UNAVAIL:
+		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN, "the loaded zfs "
+		    "module does not support an option for this operation. "
+		    "A reboot may be required to enable this option."));
+		zfs_verror(hdl, EZFS_IOC_NOTSUPPORTED, fmt, ap);
+		break;
+	case ZFS_ERR_IOC_ARG_REQUIRED:
+	case ZFS_ERR_IOC_ARG_BADTYPE:
+		zfs_verror(hdl, EZFS_IOC_NOTSUPPORTED, fmt, ap);
+		break;
 	default:
 		zfs_error_aux(hdl, strerror(error));
 		zfs_verror(hdl, EZFS_UNKNOWN, fmt, ap);
@@ -963,13 +1033,14 @@ libzfs_load_module(const char *module)
 				load = 0;
 		}
 
-		if (load && libzfs_run_process("/sbin/modprobe", argv, 0))
-			return (ENOEXEC);
-	}
+		if (load) {
+			if (libzfs_run_process("/sbin/modprobe", argv, 0))
+				return (ENOEXEC);
 
-	/* Module loading is synchronous it must be available */
-	if (!libzfs_module_loaded(module))
-		return (ENXIO);
+			if (!libzfs_module_loaded(module))
+				return (ENXIO);
+		}
+	}
 
 	/*
 	 * Device creation by udev is asynchronous and waiting may be
@@ -1051,6 +1122,26 @@ libzfs_init(void)
 	libzfs_mnttab_init(hdl);
 	fletcher_4_init();
 
+	if (getenv("ZFS_PROP_DEBUG") != NULL) {
+		hdl->libzfs_prop_debug = B_TRUE;
+	}
+
+	/*
+	 * For testing, remove some settable properties and features
+	 */
+	if (libzfs_envvar_is_set("ZFS_SYSFS_PROP_SUPPORT_TEST")) {
+		zprop_desc_t *proptbl;
+
+		proptbl = zpool_prop_get_table();
+		proptbl[ZPOOL_PROP_COMMENT].pd_zfs_mod_supported = B_FALSE;
+
+		proptbl = zfs_prop_get_table();
+		proptbl[ZFS_PROP_DNODESIZE].pd_zfs_mod_supported = B_FALSE;
+
+		zfeature_info_t *ftbl = spa_feature_table;
+		ftbl[SPA_FEATURE_LARGE_BLOCKS].fi_zfs_mod_supported = B_FALSE;
+	}
+
 	return (hdl);
 }
 
@@ -1068,7 +1159,6 @@ libzfs_fini(libzfs_handle_t *hdl)
 		(void) fclose(hdl->libzfs_sharetab);
 	zfs_uninit_libshare(hdl);
 	zpool_free_handles(hdl);
-	libzfs_fru_clear(hdl, B_TRUE);
 	namespace_clear(hdl);
 	libzfs_mnttab_fini(hdl);
 	libzfs_core_fini();
@@ -1800,6 +1890,7 @@ zprop_parse_value(libzfs_handle_t *hdl, nvpair_t *elem, int prop,
 	const char *propname;
 	char *value;
 	boolean_t isnone = B_FALSE;
+	boolean_t isauto = B_FALSE;
 	int err = 0;
 
 	if (type == ZFS_TYPE_POOL) {
@@ -1841,8 +1932,9 @@ zprop_parse_value(libzfs_handle_t *hdl, nvpair_t *elem, int prop,
 			(void) nvpair_value_string(elem, &value);
 			if (strcmp(value, "none") == 0) {
 				isnone = B_TRUE;
-			} else if (zfs_nicestrtonum(hdl, value, ivalp)
-			    != 0) {
+			} else if (strcmp(value, "auto") == 0) {
+				isauto = B_TRUE;
+			} else if (zfs_nicestrtonum(hdl, value, ivalp) != 0) {
 				goto error;
 			}
 		} else if (datatype == DATA_TYPE_UINT64) {
@@ -1872,6 +1964,31 @@ zprop_parse_value(libzfs_handle_t *hdl, nvpair_t *elem, int prop,
 		    prop == ZFS_PROP_SNAPSHOT_LIMIT)) {
 			*ivalp = UINT64_MAX;
 		}
+
+		/*
+		 * Special handling for setting 'refreservation' to 'auto'.  Use
+		 * UINT64_MAX to tell the caller to use zfs_fix_auto_resv().
+		 * 'auto' is only allowed on volumes.
+		 */
+		if (isauto) {
+			switch (prop) {
+			case ZFS_PROP_REFRESERVATION:
+				if ((type & ZFS_TYPE_VOLUME) == 0) {
+					zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+					    "'%s=auto' only allowed on "
+					    "volumes"), nvpair_name(elem));
+					goto error;
+				}
+				*ivalp = UINT64_MAX;
+				break;
+			default:
+				zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+				    "'auto' is invalid value for '%s'"),
+				    nvpair_name(elem));
+				goto error;
+			}
+		}
+
 		break;
 
 	case PROP_TYPE_INDEX:

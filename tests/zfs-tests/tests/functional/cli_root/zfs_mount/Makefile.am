@@ -14,6 +14,7 @@ dist_pkgdata_SCRIPTS = \
 	zfs_mount_010_neg.ksh \
 	zfs_mount_011_neg.ksh \
 	zfs_mount_012_neg.ksh \
+	zfs_mount_encrypted.ksh \
 	zfs_mount_all_001_pos.ksh \
 	zfs_mount_remount.ksh \
 	zfs_multi_mount.ksh
