@@ -28,7 +28,6 @@
 #include <sys/zfs_context.h>
 #include <sys/types.h>
 #include <sys/param.h>
-#include <sys/systm.h>
 #include <sys/sysmacros.h>
 #include <sys/dmu.h>
 #include <sys/dmu_impl.h>
@@ -43,6 +42,10 @@
 #include <sys/dnode.h>
 #include <sys/errno.h>
 #include <sys/zfs_context.h>
+
+#ifdef _KERNEL
+#include <sys/zfs_znode.h>
+#endif
 
 /*
  * ZFS System attributes:
@@ -700,7 +703,7 @@ sa_build_layouts(sa_handle_t *hdl, sa_bulk_attr_t *attr_desc, int attr_count,
 		boolean_t dummy;
 
 		if (hdl->sa_spill == NULL) {
-			VERIFY(dmu_spill_hold_by_bonus(hdl->sa_bonus, NULL,
+			VERIFY(dmu_spill_hold_by_bonus(hdl->sa_bonus, 0, NULL,
 			    &hdl->sa_spill) == 0);
 		}
 		dmu_buf_will_dirty(hdl->sa_spill, tx);
@@ -985,7 +988,8 @@ bail:
 	kmem_free(sa->sa_user_table, count * sizeof (sa_attr_type_t));
 	sa->sa_user_table = NULL;
 	sa_free_attr_table(sa);
-	return ((error != 0) ? error : EINVAL);
+	ASSERT(error != 0);
+	return (error);
 }
 
 int
@@ -1132,7 +1136,7 @@ sa_tear_down(objset_t *os)
 	    avl_destroy_nodes(&sa->sa_layout_hash_tree, &cookie))) {
 		sa_idx_tab_t *tab;
 		while ((tab = list_head(&layout->lot_idx_tab))) {
-			ASSERT(refcount_count(&tab->sa_refcount));
+			ASSERT(zfs_refcount_count(&tab->sa_refcount));
 			sa_idx_tab_rele(os, tab);
 		}
 	}
@@ -1285,7 +1289,13 @@ sa_build_index(sa_handle_t *hdl, sa_buf_type_t buftype)
 	/* only check if not old znode */
 	if (IS_SA_BONUSTYPE(bonustype) && sa_hdr_phys->sa_magic != SA_MAGIC &&
 	    sa_hdr_phys->sa_magic != 0) {
-		VERIFY(BSWAP_32(sa_hdr_phys->sa_magic) == SA_MAGIC);
+		if (BSWAP_32(sa_hdr_phys->sa_magic) != SA_MAGIC) {
+			mutex_exit(&sa->sa_lock);
+			zfs_dbgmsg("Buffer Header: %x != SA_MAGIC:%x "
+			    "object=%#llx\n", sa_hdr_phys->sa_magic, SA_MAGIC,
+			    db->db.db_object);
+			return (SET_ERROR(EIO));
+		}
 		sa_byteswap(hdl, buftype);
 	}
 
@@ -1317,13 +1327,13 @@ sa_idx_tab_rele(objset_t *os, void *arg)
 		return;
 
 	mutex_enter(&sa->sa_lock);
-	if (refcount_remove(&idx_tab->sa_refcount, NULL) == 0) {
+	if (zfs_refcount_remove(&idx_tab->sa_refcount, NULL) == 0) {
 		list_remove(&idx_tab->sa_layout->lot_idx_tab, idx_tab);
 		if (idx_tab->sa_variable_lengths)
 			kmem_free(idx_tab->sa_variable_lengths,
 			    sizeof (uint16_t) *
 			    idx_tab->sa_layout->lot_var_sizes);
-		refcount_destroy(&idx_tab->sa_refcount);
+		zfs_refcount_destroy(&idx_tab->sa_refcount);
 		kmem_free(idx_tab->sa_idx_tab,
 		    sizeof (uint32_t) * sa->sa_num_attrs);
 		kmem_free(idx_tab, sizeof (sa_idx_tab_t));
@@ -1337,7 +1347,7 @@ sa_idx_tab_hold(objset_t *os, sa_idx_tab_t *idx_tab)
 	ASSERTV(sa_os_t *sa = os->os_sa);
 
 	ASSERT(MUTEX_HELD(&sa->sa_lock));
-	(void) refcount_add(&idx_tab->sa_refcount, NULL);
+	(void) zfs_refcount_add(&idx_tab->sa_refcount, NULL);
 }
 
 void
@@ -1460,8 +1470,9 @@ sa_lookup_impl(sa_handle_t *hdl, sa_bulk_attr_t *bulk, int count)
 	return (sa_attr_op(hdl, bulk, count, SA_LOOKUP, NULL));
 }
 
-int
-sa_lookup(sa_handle_t *hdl, sa_attr_type_t attr, void *buf, uint32_t buflen)
+static int
+sa_lookup_locked(sa_handle_t *hdl, sa_attr_type_t attr, void *buf,
+    uint32_t buflen)
 {
 	int error;
 	sa_bulk_attr_t bulk;
@@ -1474,9 +1485,19 @@ sa_lookup(sa_handle_t *hdl, sa_attr_type_t attr, void *buf, uint32_t buflen)
 	bulk.sa_data_func = NULL;
 
 	ASSERT(hdl);
-	mutex_enter(&hdl->sa_lock);
 	error = sa_lookup_impl(hdl, &bulk, 1);
+	return (error);
+}
+
+int
+sa_lookup(sa_handle_t *hdl, sa_attr_type_t attr, void *buf, uint32_t buflen)
+{
+	int error;
+
+	mutex_enter(&hdl->sa_lock);
+	error = sa_lookup_locked(hdl, attr, buf, buflen);
 	mutex_exit(&hdl->sa_lock);
+
 	return (error);
 }
 
@@ -1500,6 +1521,173 @@ sa_lookup_uio(sa_handle_t *hdl, sa_attr_type_t attr, uio_t *uio)
 	}
 	mutex_exit(&hdl->sa_lock);
 	return (error);
+}
+
+/*
+ * For the existed object that is upgraded from old system, its ondisk layout
+ * has no slot for the project ID attribute. But quota accounting logic needs
+ * to access related slots by offset directly. So we need to adjust these old
+ * objects' layout to make the project ID to some unified and fixed offset.
+ */
+int
+sa_add_projid(sa_handle_t *hdl, dmu_tx_t *tx, uint64_t projid)
+{
+	znode_t *zp = sa_get_userdata(hdl);
+	dmu_buf_t *db = sa_get_db(hdl);
+	zfsvfs_t *zfsvfs = ZTOZSB(zp);
+	int count = 0, err = 0;
+	sa_bulk_attr_t *bulk, *attrs;
+	zfs_acl_locator_cb_t locate = { 0 };
+	uint64_t uid, gid, mode, rdev, xattr = 0, parent, gen, links;
+	uint64_t crtime[2], mtime[2], ctime[2], atime[2];
+	zfs_acl_phys_t znode_acl = { 0 };
+	char scanstamp[AV_SCANSTAMP_SZ];
+
+	if (zp->z_acl_cached == NULL) {
+		zfs_acl_t *aclp;
+
+		mutex_enter(&zp->z_acl_lock);
+		err = zfs_acl_node_read(zp, B_FALSE, &aclp, B_FALSE);
+		mutex_exit(&zp->z_acl_lock);
+		if (err != 0 && err != ENOENT)
+			return (err);
+	}
+
+	bulk = kmem_zalloc(sizeof (sa_bulk_attr_t) * ZPL_END, KM_SLEEP);
+	attrs = kmem_zalloc(sizeof (sa_bulk_attr_t) * ZPL_END, KM_SLEEP);
+	mutex_enter(&hdl->sa_lock);
+	mutex_enter(&zp->z_lock);
+
+	err = sa_lookup_locked(hdl, SA_ZPL_PROJID(zfsvfs), &projid,
+	    sizeof (uint64_t));
+	if (unlikely(err == 0))
+		/* Someone has added project ID attr by race. */
+		err = EEXIST;
+	if (err != ENOENT)
+		goto out;
+
+	/* First do a bulk query of the attributes that aren't cached */
+	if (zp->z_is_sa) {
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_MODE(zfsvfs), NULL,
+		    &mode, 8);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_GEN(zfsvfs), NULL,
+		    &gen, 8);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_UID(zfsvfs), NULL,
+		    &uid, 8);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_GID(zfsvfs), NULL,
+		    &gid, 8);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_PARENT(zfsvfs), NULL,
+		    &parent, 8);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_ATIME(zfsvfs), NULL,
+		    &atime, 16);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_MTIME(zfsvfs), NULL,
+		    &mtime, 16);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_CTIME(zfsvfs), NULL,
+		    &ctime, 16);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_CRTIME(zfsvfs), NULL,
+		    &crtime, 16);
+		if (S_ISBLK(ZTOI(zp)->i_mode) || S_ISCHR(ZTOI(zp)->i_mode))
+			SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_RDEV(zfsvfs), NULL,
+			    &rdev, 8);
+	} else {
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_ATIME(zfsvfs), NULL,
+		    &atime, 16);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_MTIME(zfsvfs), NULL,
+		    &mtime, 16);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_CTIME(zfsvfs), NULL,
+		    &ctime, 16);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_CRTIME(zfsvfs), NULL,
+		    &crtime, 16);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_GEN(zfsvfs), NULL,
+		    &gen, 8);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_MODE(zfsvfs), NULL,
+		    &mode, 8);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_PARENT(zfsvfs), NULL,
+		    &parent, 8);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_XATTR(zfsvfs), NULL,
+		    &xattr, 8);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_RDEV(zfsvfs), NULL,
+		    &rdev, 8);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_UID(zfsvfs), NULL,
+		    &uid, 8);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_GID(zfsvfs), NULL,
+		    &gid, 8);
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_ZNODE_ACL(zfsvfs), NULL,
+		    &znode_acl, 88);
+	}
+	err = sa_bulk_lookup_locked(hdl, bulk, count);
+	if (err != 0)
+		goto out;
+
+	err = sa_lookup_locked(hdl, SA_ZPL_XATTR(zfsvfs), &xattr, 8);
+	if (err != 0 && err != ENOENT)
+		goto out;
+
+	zp->z_projid = projid;
+	zp->z_pflags |= ZFS_PROJID;
+	links = ZTOI(zp)->i_nlink;
+	count = 0;
+	err = 0;
+
+	SA_ADD_BULK_ATTR(attrs, count, SA_ZPL_MODE(zfsvfs), NULL, &mode, 8);
+	SA_ADD_BULK_ATTR(attrs, count, SA_ZPL_SIZE(zfsvfs), NULL,
+	    &zp->z_size, 8);
+	SA_ADD_BULK_ATTR(attrs, count, SA_ZPL_GEN(zfsvfs), NULL, &gen, 8);
+	SA_ADD_BULK_ATTR(attrs, count, SA_ZPL_UID(zfsvfs), NULL, &uid, 8);
+	SA_ADD_BULK_ATTR(attrs, count, SA_ZPL_GID(zfsvfs), NULL, &gid, 8);
+	SA_ADD_BULK_ATTR(attrs, count, SA_ZPL_PARENT(zfsvfs), NULL, &parent, 8);
+	SA_ADD_BULK_ATTR(attrs, count, SA_ZPL_FLAGS(zfsvfs), NULL,
+	    &zp->z_pflags, 8);
+	SA_ADD_BULK_ATTR(attrs, count, SA_ZPL_ATIME(zfsvfs), NULL, &atime, 16);
+	SA_ADD_BULK_ATTR(attrs, count, SA_ZPL_MTIME(zfsvfs), NULL, &mtime, 16);
+	SA_ADD_BULK_ATTR(attrs, count, SA_ZPL_CTIME(zfsvfs), NULL, &ctime, 16);
+	SA_ADD_BULK_ATTR(attrs, count, SA_ZPL_CRTIME(zfsvfs), NULL,
+	    &crtime, 16);
+	SA_ADD_BULK_ATTR(attrs, count, SA_ZPL_LINKS(zfsvfs), NULL, &links, 8);
+	SA_ADD_BULK_ATTR(attrs, count, SA_ZPL_PROJID(zfsvfs), NULL, &projid, 8);
+
+	if (S_ISBLK(ZTOI(zp)->i_mode) || S_ISCHR(ZTOI(zp)->i_mode))
+		SA_ADD_BULK_ATTR(attrs, count, SA_ZPL_RDEV(zfsvfs), NULL,
+		    &rdev, 8);
+
+	if (zp->z_acl_cached != NULL) {
+		SA_ADD_BULK_ATTR(attrs, count, SA_ZPL_DACL_COUNT(zfsvfs), NULL,
+		    &zp->z_acl_cached->z_acl_count, 8);
+		if (zp->z_acl_cached->z_version < ZFS_ACL_VERSION_FUID)
+			zfs_acl_xform(zp, zp->z_acl_cached, CRED());
+		locate.cb_aclp = zp->z_acl_cached;
+		SA_ADD_BULK_ATTR(attrs, count, SA_ZPL_DACL_ACES(zfsvfs),
+		    zfs_acl_data_locator, &locate,
+		    zp->z_acl_cached->z_acl_bytes);
+	}
+
+	if (xattr)
+		SA_ADD_BULK_ATTR(attrs, count, SA_ZPL_XATTR(zfsvfs), NULL,
+		    &xattr, 8);
+
+	if (zp->z_pflags & ZFS_BONUS_SCANSTAMP) {
+		bcopy((caddr_t)db->db_data + ZFS_OLD_ZNODE_PHYS_SIZE,
+		    scanstamp, AV_SCANSTAMP_SZ);
+		SA_ADD_BULK_ATTR(attrs, count, SA_ZPL_SCANSTAMP(zfsvfs), NULL,
+		    scanstamp, AV_SCANSTAMP_SZ);
+		zp->z_pflags &= ~ZFS_BONUS_SCANSTAMP;
+	}
+
+	VERIFY(dmu_set_bonustype(db, DMU_OT_SA, tx) == 0);
+	VERIFY(sa_replace_all_by_template_locked(hdl, attrs, count, tx) == 0);
+	if (znode_acl.z_acl_extern_obj) {
+		VERIFY(0 == dmu_object_free(zfsvfs->z_os,
+		    znode_acl.z_acl_extern_obj, tx));
+	}
+
+	zp->z_is_sa = B_TRUE;
+
+out:
+	mutex_exit(&zp->z_lock);
+	mutex_exit(&hdl->sa_lock);
+	kmem_free(attrs, sizeof (sa_bulk_attr_t) * ZPL_END);
+	kmem_free(bulk, sizeof (sa_bulk_attr_t) * ZPL_END);
+	return (err);
 }
 #endif
 
@@ -1560,7 +1748,7 @@ sa_find_idx_tab(objset_t *os, dmu_object_type_t bonustype, sa_hdr_phys_t *hdr)
 	idx_tab->sa_idx_tab =
 	    kmem_zalloc(sizeof (uint32_t) * sa->sa_num_attrs, KM_SLEEP);
 	idx_tab->sa_layout = tb;
-	refcount_create(&idx_tab->sa_refcount);
+	zfs_refcount_create(&idx_tab->sa_refcount);
 	if (tb->lot_var_sizes)
 		idx_tab->sa_variable_lengths = kmem_alloc(sizeof (uint16_t) *
 		    tb->lot_var_sizes, KM_SLEEP);
@@ -2066,4 +2254,5 @@ EXPORT_SYMBOL(sa_hdrsize);
 EXPORT_SYMBOL(sa_handle_lock);
 EXPORT_SYMBOL(sa_handle_unlock);
 EXPORT_SYMBOL(sa_lookup_uio);
+EXPORT_SYMBOL(sa_add_projid);
 #endif /* _KERNEL */
